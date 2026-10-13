@@ -5728,6 +5728,7 @@ mod tests {
             max_retry_credentials: crate::DEFAULT_MAX_RETRY_CREDENTIALS,
             max_retry_interval: crate::DEFAULT_MAX_RETRY_INTERVAL,
             streaming_bootstrap_retries: crate::DEFAULT_STREAMING_BOOTSTRAP_RETRIES,
+            skip_bundled_core_auto_install: false,
         };
         let record = normalize_usage_record(
             serde_json::json!({

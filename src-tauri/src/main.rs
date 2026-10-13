@@ -63,7 +63,7 @@ use objc2::MainThreadMarker;
 use objc2_app_kit::NSEvent;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
 use std::{
@@ -304,6 +304,9 @@ struct CoreProcessState {
     starting: AtomicBool,
     shutting_down: AtomicBool,
     shutdown_complete: AtomicBool,
+    user_stopped: AtomicBool,
+    unexpected_exit_detected: AtomicBool,
+    crash_restart_attempts: AtomicU32,
 }
 
 #[derive(Default)]
@@ -646,6 +649,8 @@ struct GuiConfigFile {
     max_retry_credentials: u32,
     max_retry_interval: i64,
     streaming_bootstrap_retries: u32,
+    #[serde(default)]
+    skip_bundled_core_auto_install: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -953,6 +958,7 @@ impl Default for GuiConfigFile {
             max_retry_credentials: DEFAULT_MAX_RETRY_CREDENTIALS,
             max_retry_interval: DEFAULT_MAX_RETRY_INTERVAL,
             streaming_bootstrap_retries: DEFAULT_STREAMING_BOOTSTRAP_RETRIES,
+            skip_bundled_core_auto_install: false,
         }
     }
 }
@@ -1690,6 +1696,8 @@ struct CoreMetadata {
     version: String,
     asset_name: String,
     installed_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom_build: Option<bool>,
 }
 
 struct DownloadedArchive {
@@ -1911,6 +1919,9 @@ impl CoreProcessState {
             starting: AtomicBool::new(starting),
             shutting_down: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
+            user_stopped: AtomicBool::new(false),
+            unexpected_exit_detected: AtomicBool::new(false),
+            crash_restart_attempts: AtomicU32::new(0),
         }
     }
 
@@ -1934,6 +1945,45 @@ impl CoreProcessState {
         self.starting.store(starting, Ordering::Release);
     }
 
+    fn is_user_stopped(&self) -> bool {
+        self.user_stopped.load(Ordering::Acquire)
+    }
+
+    fn set_user_stopped(&self, stopped: bool) {
+        self.user_stopped.store(stopped, Ordering::Release);
+        if stopped {
+            self.unexpected_exit_detected.store(false, Ordering::Release);
+        }
+    }
+
+    fn reset_crash_restart_attempts(&self) {
+        self.crash_restart_attempts.store(0, Ordering::Release);
+    }
+
+    fn record_crash_restart_attempt(&self) -> u32 {
+        self.crash_restart_attempts.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn poll_unexpected_child_exit(&self) -> bool {
+        if let Ok(mut child) = self.child.lock() {
+            if let Some(process) = child.as_mut() {
+                if let Ok(Some(_)) = process.try_wait() {
+                    *child = None;
+                    if !self.is_user_stopped() && !self.is_shutting_down() {
+                        self.unexpected_exit_detected.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+        self.unexpected_exit_detected.swap(false, Ordering::AcqRel)
+    }
+
+    fn requeue_unexpected_child_exit(&self) {
+        if !self.is_user_stopped() && !self.is_shutting_down() {
+            self.unexpected_exit_detected.store(true, Ordering::Release);
+        }
+    }
+
     fn managed_pid(&self) -> Option<u32> {
         if let Ok(mut child) = self.child.lock() {
             if let Some(process) = child.as_mut() {
@@ -1942,6 +1992,9 @@ impl CoreProcessState {
                 }
 
                 *child = None;
+                if !self.is_user_stopped() && !self.is_shutting_down() {
+                    self.unexpected_exit_detected.store(true, Ordering::Release);
+                }
             }
         }
 
@@ -1977,6 +2030,10 @@ impl CoreProcessState {
             .collect();
         adopted.sort_unstable_by_key(|process| process.process_id);
         adopted.dedup_by_key(|process| process.process_id);
+        if !adopted.is_empty() {
+            self.set_user_stopped(false);
+            self.reset_crash_restart_attempts();
+        }
         Ok(())
     }
 
@@ -2003,6 +2060,8 @@ impl CoreProcessState {
             .lock()
             .map_err(|_| "Kernel process status lock is poisoned".to_string())?;
         *managed_child = Some(child);
+        self.set_user_stopped(false);
+        self.unexpected_exit_detected.store(false, Ordering::Release);
         Ok(pid)
     }
 }
@@ -2699,6 +2758,7 @@ fn main() {
                     emit_core_status(&core_app, &status);
                 }
             });
+            start_core_crash_supervisor(app.handle().clone());
 
             if let Some(ack_path) = portable_update_ack.as_ref() {
                 fs::write(ack_path, env!("CARGO_PKG_VERSION").as_bytes())

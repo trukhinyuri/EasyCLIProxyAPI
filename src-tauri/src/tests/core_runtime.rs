@@ -887,6 +887,7 @@ fn bundled_core_install_replaces_older_installs_without_downgrading() {
                 version: installed.to_string(),
                 asset_name: "installed-core.zip".to_string(),
                 installed_at_unix: 0,
+                custom_build: None,
             },
         )
         .unwrap();
@@ -903,6 +904,48 @@ fn bundled_core_install_replaces_older_installs_without_downgrading() {
 }
 
 #[test]
+fn bundled_core_install_preserves_custom_builds_against_bundled_downgrade() {
+    let root = agent_test_home("bundled-custom-build-protection");
+    let install_dir = root.join("cpa-core");
+    fs::create_dir_all(&install_dir).unwrap();
+    fs::write(install_dir.join(core_binary_name()), b"custom core").unwrap();
+
+    // 1. Version suffix `-custom` (even though semver treats 8.0.27-custom < 8.0.27)
+    write_core_metadata(
+        &install_dir,
+        &CoreMetadata {
+            version: "v8.0.27-custom".to_string(),
+            asset_name: "CLIProxyAPI_8.0.27_darwin_aarch64.tar.gz".to_string(),
+            installed_at_unix: 100,
+            custom_build: None,
+        },
+    )
+    .unwrap();
+    assert!(!core_needs_bundled_install(&install_dir, "v8.0.27"));
+    assert!(!core_needs_bundled_install(&install_dir, "v8.0.28"));
+
+    // 2. Explicit `custom_build: Some(true)` flag
+    write_core_metadata(
+        &install_dir,
+        &CoreMetadata {
+            version: "v8.0.27".to_string(),
+            asset_name: "CLIProxyAPI_8.0.27_darwin_aarch64.tar.gz".to_string(),
+            installed_at_unix: 101,
+            custom_build: Some(true),
+        },
+    )
+    .unwrap();
+    assert!(!core_needs_bundled_install(&install_dir, "v8.0.28"));
+    remember_bundled_core_when_up_to_date(&install_dir, "v8.0.28").unwrap();
+    assert!(install_dir.join("cpa-gui-bundled-core-handled.txt").is_file());
+
+    // 3. Missing binary still requires bundled install even if metadata says custom
+    fs::remove_file(install_dir.join(core_binary_name())).unwrap();
+    assert!(core_needs_bundled_install(&install_dir, "v8.0.28"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn handled_bundled_core_does_not_undo_a_manual_rollback_on_restart() {
     let root = agent_test_home("bundled-manual-rollback");
     let install_dir = root.join("cpa-core");
@@ -915,6 +958,7 @@ fn handled_bundled_core_does_not_undo_a_manual_rollback_on_restart() {
             version: "v7.3.15".to_string(),
             asset_name: "installed-core.zip".to_string(),
             installed_at_unix: 0,
+            custom_build: None,
         },
     )
     .unwrap();
@@ -944,6 +988,7 @@ fn an_already_newer_core_satisfies_the_bundle_after_manual_rollback() {
             version: "v7.3.18".to_string(),
             asset_name: "installed-core.zip".to_string(),
             installed_at_unix: 0,
+            custom_build: None,
         },
     )
     .unwrap();
@@ -956,6 +1001,7 @@ fn an_already_newer_core_satisfies_the_bundle_after_manual_rollback() {
             version: "v7.3.15".to_string(),
             asset_name: "manual-rollback.zip".to_string(),
             installed_at_unix: 1,
+            custom_build: None,
         },
     )
     .unwrap();
@@ -1163,3 +1209,156 @@ fn core_start_log_captures_stdout_and_stderr() {
     assert_eq!(restarted_output.matches("===== CPA kernel startup").count(), 2);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn apply_staged_core_with_rollback_restores_previous_binary_on_restart_failure() {
+    let root = agent_test_home("core-staged-rollback");
+    let install_dir = root.join("cpa-core");
+    let staging_dir = root.join("cpa-core.staging");
+    let rollback_dir = root.join("cpa-core.rollback");
+    fs::create_dir_all(&install_dir).unwrap();
+    fs::create_dir_all(&staging_dir).unwrap();
+
+    fs::write(install_dir.join(core_binary_name()), b"working-v1-binary").unwrap();
+    write_core_metadata(
+        &install_dir,
+        &CoreMetadata {
+            version: "v8.0.26".to_string(),
+            asset_name: "v8.0.26.tar.gz".to_string(),
+            installed_at_unix: 10,
+            custom_build: Some(true),
+        },
+    )
+    .unwrap();
+
+    // 1. Empty staged binary is rejected before touching install_dir
+    fs::write(staging_dir.join(core_binary_name()), b"").unwrap();
+    assert!(apply_staged_core_with_rollback(&install_dir, &staging_dir, &rollback_dir, || Ok(())).is_err());
+    assert_eq!(
+        fs::read(install_dir.join(core_binary_name())).unwrap(),
+        b"working-v1-binary"
+    );
+
+    // 2. Staged binary that fails restart rolls back to working-v1-binary and metadata
+    fs::write(staging_dir.join(core_binary_name()), b"broken-v2-binary").unwrap();
+    write_core_metadata(
+        &staging_dir,
+        &CoreMetadata {
+            version: "v8.0.27".to_string(),
+            asset_name: "v8.0.27.tar.gz".to_string(),
+            installed_at_unix: 20,
+            custom_build: None,
+        },
+    )
+    .unwrap();
+
+    let err = apply_staged_core_with_rollback(&install_dir, &staging_dir, &rollback_dir, || {
+        Err("new binary exited immediately".to_string())
+    })
+    .unwrap_err();
+    assert!(err.contains("failed to automatically resume operation"));
+    assert_eq!(
+        fs::read(install_dir.join(core_binary_name())).unwrap(),
+        b"working-v1-binary"
+    );
+    let restored_meta = read_core_metadata(&install_dir).unwrap();
+    assert_eq!(restored_meta.version, "v8.0.26");
+    assert_eq!(restored_meta.custom_build, Some(true));
+    assert!(!rollback_dir.exists());
+
+    // 3. Staged binary that succeeds restart keeps new binary and cleans up rollback_dir
+    fs::create_dir_all(&staging_dir).unwrap();
+    fs::write(staging_dir.join(core_binary_name()), b"healthy-v2-binary").unwrap();
+    write_core_metadata(
+        &staging_dir,
+        &CoreMetadata {
+            version: "v8.0.27".to_string(),
+            asset_name: "v8.0.27.tar.gz".to_string(),
+            installed_at_unix: 30,
+            custom_build: None,
+        },
+    )
+    .unwrap();
+    apply_staged_core_with_rollback(&install_dir, &staging_dir, &rollback_dir, || Ok(())).unwrap();
+    assert_eq!(
+        fs::read(install_dir.join(core_binary_name())).unwrap(),
+        b"healthy-v2-binary"
+    );
+    assert_eq!(read_core_metadata(&install_dir).unwrap().version, "v8.0.27");
+    assert!(!rollback_dir.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn core_crash_supervisor_recovers_unexpected_exit_with_bounded_backoff_and_ignores_user_stop() {
+    let state = CoreProcessState::new(false);
+    let mut observed_backoffs = Vec::new();
+
+    for expected_backoff in [
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    ] {
+        let mut child = spawn_core_child(core_child_sleep_command()).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        state.store_child(child).unwrap();
+        // Even if managed_pid() is polled before the supervisor tick, unexpected exit is preserved
+        assert_eq!(state.managed_pid(), None);
+
+        let recovered = check_and_recover_crashed_core(&state, |backoff| {
+            observed_backoffs.push(backoff);
+            Ok(())
+        })
+        .unwrap();
+        assert!(recovered);
+        assert_eq!(observed_backoffs.last().copied(), Some(expected_backoff));
+    }
+
+    // 4th consecutive crash exceeds MAX_CORE_CRASH_RESTART_ATTEMPTS (3)
+    let mut child = spawn_core_child(core_child_sleep_command()).unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    state.store_child(child).unwrap();
+    let fourth = check_and_recover_crashed_core(&state, |_| Ok(()));
+    assert!(fourth.is_err());
+
+    // User-initiated stop resets attempts and prevents supervisor recovery
+    state.reset_crash_restart_attempts();
+    let mut child = spawn_core_child(core_child_sleep_command()).unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    state.store_child(child).unwrap();
+    state.set_user_stopped(true);
+    assert!(!check_and_recover_crashed_core(&state, |_| Ok(())).unwrap());
+
+    // Failed restart attempts rearm unexpected_exit_detected so later supervisor ticks retry (1s -> 2s -> 5s)
+    state.set_user_stopped(false);
+    state.reset_crash_restart_attempts();
+    let mut child = spawn_core_child(core_child_sleep_command()).unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    state.store_child(child).unwrap();
+
+    let mut failed_backoffs = Vec::new();
+    for expected in [Duration::from_secs(1), Duration::from_secs(2)] {
+        let err = check_and_recover_crashed_core(&state, |backoff| {
+            failed_backoffs.push(backoff);
+            Err("port still busy".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(err, "port still busy");
+        assert_eq!(failed_backoffs.last().copied(), Some(expected));
+    }
+    // 3rd attempt (5s backoff) succeeds without needing another child exit
+    let mut third_backoff = None;
+    assert!(
+        check_and_recover_crashed_core(&state, |backoff| {
+            third_backoff = Some(backoff);
+            Ok(())
+        })
+        .unwrap()
+    );
+    assert_eq!(third_backoff, Some(Duration::from_secs(5)));
+}
+
